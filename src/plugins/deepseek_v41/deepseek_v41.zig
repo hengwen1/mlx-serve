@@ -674,6 +674,20 @@ fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
     };
 }
 
+/// A small table read as DENSE rows (DSpark's markov pair): a pack that ships it
+/// quantized (oMLX's mxfp4) is dequantized at load; `in_dim` is its logical width.
+fn denseDequant(m: *Dsv41Model, w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !A {
+    var wt = try getW(w, fmt, args);
+    var nbuf: NameBuf = undefined;
+    var sbuf: NameBuf = undefined;
+    const name = std.fmt.bufPrint(&nbuf, fmt, args) catch return error.NameTooLong;
+    const scales = std.fmt.bufPrint(&sbuf, "{s}.scales", .{name[0 .. name.len - ".weight".len]}) catch return error.NameTooLong;
+    var sc = w.get(scales) orelse return wt;
+    var bi = none;
+    try weights_load.dequantizeSmall(&wt, &sc, &bi, in_dim, &m.owned, m.gpa, m.s);
+    return wt;
+}
+
 fn getOpt(w: *const Weights, comptime fmt: []const u8, args: anytype) ?A {
     var buf: NameBuf = undefined;
     const name = std.fmt.bufPrint(&buf, fmt, args) catch return null;
@@ -1483,8 +1497,8 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const Config, w: *Weights, s: S, opts:
             .main_proj = try getLin(w, cfg.hidden_size * targets, "mtp.0.main_proj", .{}),
             .main_norm = try ownCast(m, try getW(w, "mtp.0.main_norm.weight", .{}), m.act),
             .norm = try ownCast(m, try getW(w, "mtp.{d}.norm.weight", .{last}), m.act),
-            .markov_embed = try getW(w, "mtp.{d}.markov_head.embed.weight", .{last}),
-            .markov_head = try ownCast(m, try getW(w, "mtp.{d}.markov_head.head.weight", .{last}), m.act),
+            .markov_embed = try denseDequant(m, w, "mtp.{d}.markov_head.embed.weight", .{last}, cfg.dsv4_dspark_markov_rank),
+            .markov_head = try ownCast(m, try denseDequant(m, w, "mtp.{d}.markov_head.head.weight", .{last}, cfg.dsv4_dspark_markov_rank), m.act),
             .conf = try ownCast(m, try getW(w, "mtp.{d}.confidence_head.proj.weight", .{last}), .float32),
         };
         m.n_mtp = n_stages;

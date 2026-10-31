@@ -8,6 +8,7 @@ const log = @import("../util/log.zig");
 const resident = @import("resident.zig");
 const modelopt_pack = @import("../quant/nvfp4/modelopt_pack.zig");
 const affineParamsFromGeometry = @import("../quant/params.zig").affineParamsFromGeometry;
+const quantParamsFromGeometry = @import("../quant/params.zig").quantParamsFromGeometry;
 pub const Weights = resident.Weights;
 pub const loadWeightsFile = resident.loadWeightsFile;
 
@@ -169,9 +170,9 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
     return weights;
 }
 
-/// An affine weight (`.scales` AND `.biases` beside it) stored as uint8 is MLX's packed
-/// uint32 words written byte-wise (Recursive's Flint export); MLX's quantized kernels read
-/// uint32 only. NVFP4/MXFP8/FP8 bytes carry no `.biases` and keep their dtype.
+/// A quantized weight stored as uint8 is MLX's packed uint32 words written byte-wise — affine
+/// (Recursive's Flint export: `.scales` AND `.biases` beside it) or an fp family (oMLX's mxfp4
+/// packs: uint8 `.scales`, no `.biases`) — and MLX's quantized kernels read uint32 only.
 pub fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
     var buf: [512]u8 = undefined;
     var it = weights.map.iterator();
@@ -182,9 +183,11 @@ pub fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
         if (shape.len == 0 or @rem(shape[shape.len - 1], 4) != 0) continue;
         const base = key[0 .. key.len - ".weight".len];
         const scales = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue;
-        if (weights.map.get(scales) == null) continue;
+        const sc = weights.map.get(scales) orelse continue;
         const biases = std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch continue;
-        if (weights.map.get(biases) == null) continue;
+        // Affine carries per-group float biases; the fp families carry uint8 (e8m0/e4m3) scales
+        // and no biases at all. A float-scaled, bias-less pair is no layout we know: leave it.
+        if (weights.map.get(biases) == null and mlx.mlx_array_dtype(sc) != .uint8) continue;
         var words = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_view(&words, e.value_ptr.*, .uint32, s));
         _ = mlx.mlx_array_free(e.value_ptr.*);
@@ -392,11 +395,27 @@ pub var narrow_1d_cached: ?bool = null;
 /// reading as "this checkpoint just isn't f16".
 pub var narrowed_1d: usize = 0;
 
-/// A tiny affine-quantized tensor rewritten as the dense `[out, in]` a dense
+/// A tiny quantized tensor rewritten as the dense `[out, in]` a dense
 /// checkpoint ships (untransposed), so the paths keyed on the dense layout
-/// (hc prefill, the fused HC read, the softmax_gate fold) serve it too.
+/// (hc prefill, the fused HC read, the softmax_gate fold, DSpark's markov
+/// rows) serve it too. Affine (float scales + biases) or fp family (uint8
+/// scales, no biases).
 pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, in_dim: u32, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
-    if (sc.ctx == null or bi.ctx == null) return;
+    if (sc.ctx == null) return;
+    if (bi.ctx == null) {
+        // The fp families carry uint8 (e8m0/e4m3) scales and no biases; float
+        // scales without biases are no layout we know — leave the weight.
+        if (mlx.mlx_array_dtype(sc.*) != .uint8) return;
+        const qp = quantParamsFromGeometry(w.*, sc.*, false, in_dim) orelse return;
+        var d = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(d);
+        try mlx.check(mlx.mlx_dequantize(&d, w.*, sc.*, .{ .ctx = null }, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+        try mlx.check(mlx.mlx_array_eval(d));
+        try owned.append(allocator, d);
+        w.* = d;
+        sc.* = mlx.mlx_array_new();
+        return;
+    }
     const qp = affineParamsFromGeometry(w.*, sc.*, in_dim) orelse return;
     var d = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(d);
@@ -406,4 +425,99 @@ pub fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array
     w.* = d;
     sc.* = mlx.mlx_array_new();
     bi.* = mlx.mlx_array_new();
+}
+
+// ── tests ──
+const testing = std.testing;
+
+test "dequantizeSmall: an fp-family weight (uint8 scales, no biases) densifies too" {
+    // oMLX's mxfp4 V4.1 pack ships DSpark's markov tables quantized; the draft
+    // reads them as dense rows. in_dim 128, 4 bits, gs 32 → w [4,16] u32 + [4,4] u8.
+    const s = mlx.gpuStream();
+    var host: [4 * 128]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) / 6.0 - 1.0;
+    const w = mlx.mlx_array_new_data(&host, &[_]c_int{ 4, 128 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, w, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, s));
+    var q = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q, qv, 0));
+    var sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, q, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(want));
+
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(std.testing.allocator);
+    }
+    const none = mlx.mlx_array{ .ctx = null };
+    try dequantizeSmall(&q, &sc, @constCast(&none), 128, &owned, std.testing.allocator, s);
+    try testing.expect(sc.ctx == null);
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(q));
+    try testing.expectEqualSlices(c_int, &.{ 4, 128 }, mlx.getShape(q));
+    // The dense form is bf16; compare both sides through that precision.
+    var wbf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wbf);
+    try mlx.check(mlx.mlx_astype(&wbf, want, .bfloat16, s));
+    var qf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qf);
+    try mlx.check(mlx.mlx_astype(&qf, wbf, .float32, s));
+    var rf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rf);
+    try mlx.check(mlx.mlx_astype(&rf, q, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(qf));
+    try mlx.check(mlx.mlx_array_eval(rf));
+    try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(qf).?[0 .. 4 * 128], mlx.mlx_array_data_float32(rf).?[0 .. 4 * 128]);
+}
+
+test "viewByteAffineWeights: fp-family bytes (uint8 codes + uint8 scales, no biases) view to uint32 words" {
+    // oMLX's mxfp4 packs write the packed bits as raw U8 where mlx-lm writes
+    // U32 words; MLX's quantized kernels read uint32 only. A view of the same
+    // bytes must dequantize to the same values the words do.
+    const s = mlx.gpuStream();
+    var host: [4 * 128]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) / 8.0 - 1.0;
+    const w = mlx.mlx_array_new_data(&host, &[_]c_int{ 4, 128 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, w, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, s));
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    try mlx.check(mlx.mlx_vector_array_get(&q, qv, 0));
+    var sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+    // The pack's shape: the words' bytes, as U8 (the map owns `bytes` and `sc`).
+    var bytes = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_view(&bytes, q, .uint8, s));
+
+    var weights = Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.weight"), bytes);
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.scales"), sc);
+    try viewByteAffineWeights(&weights, s);
+    const viewed = weights.map.get("t.weight").?;
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(viewed));
+    try testing.expectEqualSlices(c_int, &.{ 4, 16 }, mlx.getShape(viewed));
+    const qp = quantParamsFromGeometry(viewed, sc, false, 128) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 4), qp.bits);
+    try testing.expectEqual(@as(u32, 32), qp.group_size);
+    try testing.expectEqual(@import("../quant/params.zig").QuantMode.mxfp4, qp.mode);
+
+    // Bit-equal dequantize through the viewed words.
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, q, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    var got = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_dequantize(&got, viewed, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(want));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0 .. 4 * 128], mlx.mlx_array_data_float32(got).?[0 .. 4 * 128]);
 }

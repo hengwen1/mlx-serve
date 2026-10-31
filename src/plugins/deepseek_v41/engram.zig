@@ -250,15 +250,17 @@ pub const Table = struct {
     s_stride: u64,
     slen: usize,
     b_off: u64 = 0,
+    /// Bytes the table occupies in the pack's dir sum (the `*.safetensors` the loader scans); a table in a
+    /// subdirectory (the repack's `engram/`) never enters that sum and bills nothing.
+    billed: u64 = 0,
 
     pub fn close(self: *Table) void {
         crt.close(self.fd);
     }
 
-    /// Bytes this table occupies inside the pack's safetensors shards (read by
-    /// pread, never resident); a repack table lives outside them.
+    /// Bytes this table occupies inside the pack's dir sum (read by pread, never resident).
     pub fn shardBytes(self: *const Table) u64 {
-        return if (self.mode == .affine) self.rows * (self.w_stride + 2 * self.s_stride) else 0;
+        return self.billed;
     }
 
     /// Layer `layer`'s table in `dir`; `index` is its position among the
@@ -291,6 +293,7 @@ pub const Table = struct {
             return error.EngramManifest;
         } else |_| {}
         if (try openRawTable(a, dir, dir_path, layer, rows, head_dim)) |t| return t;
+        if (try openManifestTable(a, dir_path, layer, rows, head_dim)) |t| return t;
         // An MLX pack: the three tensors in one shard named by the index.
         const index_raw = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(64 << 20)) catch return error.EngramTableMissing;
         const idx = std.json.parseFromSliceLeaky(std.json.Value, a, index_raw, .{}) catch return error.EngramTableMissing;
@@ -340,6 +343,7 @@ pub const Table = struct {
             .s_stride = scols * 2,
             .slen = @intCast(scols * 2),
             .b_off = base + regions[2].start,
+            .billed = rows * (wcols * 4 + 2 * (scols * 2)),
         };
     }
 
@@ -360,7 +364,48 @@ pub const Table = struct {
         const scale_key = spec.scale_key orelse return error.EngramTableHeader;
         if (spec.scale_file) |sf| if (!std.mem.eql(u8, sf, spec.weight_file)) return error.EngramTableSplit;
         if (std.mem.indexOf(u8, spec.weight_file, "..") != null or std.fs.path.isAbsolute(spec.weight_file)) return error.EngramTableMissing;
-        const fd = try openAt(a, dir_path, spec.weight_file);
+        return try openFp8Shard(a, dir_path, spec.weight_file, spec.weight_key, scale_key, rows, head_dim);
+    }
+
+    /// The layered oMLX packs (`model-layers-NN.safetensors` beside one `model-layers-NN.manifest.json`
+    /// a layer, no `model.safetensors.index.json`, no `omlx_deepseek_v41` section): the manifest's
+    /// `files` map names the sidecar `-engram.safetensors` shard holding the layer's raw fp8 table.
+    fn openManifestTable(a: std.mem.Allocator, dir_path: []const u8, layer: usize, rows: u64, head_dim: u32) !?Table {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+        defer dir.close(io);
+        const weight = try std.fmt.allocPrint(a, "layers.{d}.engram.embed.weight", .{layer});
+        const scale = try std.fmt.allocPrint(a, "layers.{d}.engram.embed.scale", .{layer});
+        var it = dir.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file and entry.kind != .sym_link) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".manifest.json")) continue;
+            const raw = dir.readFileAlloc(io, entry.name, a, .limited(16 << 20)) catch continue;
+            const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, raw, .{}) catch continue;
+            const files = if (parsed == .object) parsed.object.get("files") else null;
+            if (files == null or files.? != .object) continue;
+            var fit = files.?.object.iterator();
+            while (fit.next()) |fe| {
+                if (fe.value_ptr.* != .array) continue;
+                var found: [2][]const u8 = .{ "", "" };
+                for (fe.value_ptr.array.items) |n| {
+                    if (n != .string) continue;
+                    const bare = if (std.mem.startsWith(u8, n.string, weights_load.dsv41_text_prefix)) n.string[weights_load.dsv41_text_prefix.len..] else n.string;
+                    if (std.mem.eql(u8, bare, weight)) found[0] = n.string else if (std.mem.eql(u8, bare, scale)) found[1] = n.string;
+                }
+                if (found[0].len == 0 or found[1].len == 0) continue;
+                const file = fe.key_ptr.*;
+                if (std.mem.indexOf(u8, file, "..") != null or std.fs.path.isAbsolute(file)) return error.EngramTableMissing;
+                return try openFp8Shard(a, dir_path, file, found[0], found[1], rows, head_dim);
+            }
+        }
+        return null;
+    }
+
+    /// One raw fp8 table (e4m3 codes, one e8m0 scale per 32) inside one pack shard. A shard the dir
+    /// scan counts (a top-level file) bills its bytes back off the resident sum; a subdir one does not.
+    fn openFp8Shard(a: std.mem.Allocator, dir_path: []const u8, file: []const u8, weight_key: []const u8, scale_key: []const u8, rows: u64, head_dim: u32) !Table {
+        const fd = try openAt(a, dir_path, file);
         errdefer crt.close(fd);
         var hl: [8]u8 = undefined;
         if (crt.pread(fd, &hl, 8, 0) != 8) return error.EngramTableHeader;
@@ -372,11 +417,11 @@ pub const Table = struct {
         if (hdr != .object) return error.EngramTableHeader;
         const size: usize = @intCast(fileSize(fd));
         const base = 8 + hlen;
-        const w = qwen4_ple.headerRegion(hdr.object, spec.weight_key, "F8_E4M3", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
+        const w = qwen4_ple.headerRegion(hdr.object, weight_key, "F8_E4M3", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
         const s = qwen4_ple.headerRegion(hdr.object, scale_key, "F8_E8M0", 1, size, @intCast(base), .matrix) catch return error.EngramTableHeader;
         if (w.rows != rows or s.rows != rows) return error.EngramTableSize;
         if (w.cols != head_dim or s.cols * 32 != head_dim) return error.EngramTableGeometry;
-        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols };
+        return .{ .fd = fd, .rows = rows, .head_dim = head_dim, .mode = .mxfp8, .bits = 8, .group_size = 32, .w_off = base + w.start, .w_stride = head_dim, .wlen = head_dim, .s_off = base + s.start, .s_stride = s.cols, .slen = s.cols, .billed = if (std.mem.indexOfScalar(u8, file, '/') == null) rows * (head_dim + head_dim / 32) else 0 };
     }
 
     /// Rows `ids` as they sit on disk (host only, any thread).
@@ -929,6 +974,51 @@ test "dsv41 engram: a prefetch hands each span's rows as a gather of the same id
     try mlx.check(mlx.mlx_array_eval(want));
     try mlx.check(mlx.mlx_array_eval(got));
     try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0 .. 4 * 64], mlx.mlx_array_data_float32(got).?[0 .. 4 * 64]);
+}
+
+// The layered oMLX packs (`model-layers-NN.safetensors`, one `model-layers-NN.manifest.json` a layer, no
+// `model.safetensors.index.json`, no `omlx_deepseek_v41` section): the trunk shard beside its sidecar
+// `-engram.safetensors`, the manifest's `files` map naming every file's tensors.
+fn writeLayeredFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
+    const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
+        "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
+    var shard: [8 + hdr.len + 264]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    const data = shard[8 + hdr.len ..];
+    @memset(data[0..256], 0x38); // e4m3 1.0
+    for (0..4) |r| {
+        data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
+        data[256 + 2 * r + 1] = 126; // 0.5 for the rest
+    }
+    try dir.writeFile(io, .{ .sub_path = "model-layers-01-engram.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "model-layers-01.manifest.json", .data = "{\"files\":{" ++
+        "\"model-layers-01.safetensors\":[\"layers.1.engram.wkv.weight\"]," ++
+        "\"model-layers-01-engram.safetensors\":[\"layers.1.engram.embed.scale\",\"layers.1.engram.embed.weight\"]}," ++
+        "\"modules\":{}}" });
+    try dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"deepseek_v41\"}" });
+}
+
+test "dsv41 engram: a layered oMLX pack's sidecar shard (named by its layer manifest) opens and bills its bytes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeLayeredFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
+    // The sidecar sits in the pack's dir sum, unlike the repack's engram/ dir: its bytes are billed back off.
+    try testing.expectEqual(@as(u64, 4 * (64 + 2)), t.shardBytes());
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rows = try t.gather(testing.allocator, &.{ 3, 0 }, s);
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const v = mlx.mlx_array_data_float32(rows).?;
+    try testing.expectEqual(@as(f32, 8), v[0]);
+    try testing.expectEqual(@as(f32, 0.5), v[63]);
+    try testing.expectEqual(@as(f32, 1), v[64]);
+    try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
 }
 
 test "dsv41 engram: a pack with no token map (oMLX's) gets V4.1's own tokenizer's" {
