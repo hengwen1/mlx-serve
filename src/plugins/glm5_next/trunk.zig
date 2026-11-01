@@ -20,6 +20,7 @@ const moe = @import("../../sdk/bases/blocks/moe.zig");
 const compiled = @import("../../sdk/bases/blocks/compiled.zig");
 const gdn_base = @import("../../sdk/bases/blocks/gdn.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
+const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const params = @import("../../sdk/quant/params.zig");
 const fp8_block128 = @import("../../sdk/quant/fp8_block128.zig");
 const fused_rows = @import("../../sdk/blocks/linear/fused_rows.zig");
@@ -466,6 +467,8 @@ const Loader = struct {
         if (t.s.ctx == null) return .{ .w = t.w };
         // e4m3: the matmul knows it by its dtypes; no affine kernel may claim it.
         if (fp8_block128.isBlockScaled(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = fp8_block128.block_cols };
+        // An HF export's block-FP8 projection after its grid became per-row scales: the row-scaled reader.
+        if (sushi_pack.isRowScaledFp8(t.w, t.s)) return .{ .w = t.w, .s = t.s, .bits = 0, .group_size = 128 };
         const qp = resolve(l.c, t.w, t.s, in_dim);
         return .{ .w = t.w, .s = t.s, .b = t.b, .bits = qp.bits, .group_size = qp.group_size, .mode = qp.mode };
     }

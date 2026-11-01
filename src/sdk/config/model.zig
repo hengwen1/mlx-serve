@@ -336,6 +336,9 @@ pub const ModelConfig = struct {
     exl3: ?exl3.Spec = null,
     /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
     modelopt: bool = false,
+    /// A block-FP8 export (`quantization_config.quant_method: "fp8"`, `weight_block_size [128, 128]`):
+    /// the load's HF-pack moves re-encode its banks and broadcast its dense grids.
+    block_fp8: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
@@ -2673,6 +2676,15 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.quant_group_size = 16;
         config.quant_mode = .nvfp4;
     }
+    if (jsonField(outer, "quantization_config")) |qc| if (qc == .object) {
+        const m = qc.object.get("quant_method");
+        const wbs = qc.object.get("weight_block_size");
+        if (m != null and m.? == .string and std.mem.eql(u8, m.?.string, "fp8")) if (wbs != null and wbs.? == .array and wbs.?.array.items.len == 2) {
+            const lo = wbs.?.array.items[0];
+            const hi = wbs.?.array.items[1];
+            config.block_fp8 = lo == .integer and hi == .integer and lo.integer == 128 and hi.integer == 128;
+        };
+    };
 
     // EOS tokens
     if (jsonField(root, "eos_token_id")) |v| {
@@ -5016,7 +5028,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
     }
-    if (config.exl3 != null or config.modelopt or (config.expert_bank and config.isGlm5())) {
+    if (config.exl3 != null or config.modelopt or (config.expert_bank and config.isGlm5()) or config.isGlm5() or config.block_fp8) {
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try sushi_pack.adapt(config, &weights, s);

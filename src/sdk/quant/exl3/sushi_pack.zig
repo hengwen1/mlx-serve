@@ -332,11 +332,15 @@ fn rowScales(scales: mlx.mlx_array, tp: u32, per: u32, from: u32, to: u32, s: ml
 }
 
 /// Row-scaled e4m3 (`.weight` u8 codes `[R, K]`, `.scales` f32 `[R, K / 128]`): neither affine's
-/// bf16 scales nor MX's u8 ones. Only Sushi's MiMo trunk stores this pair; a new format that does
-/// must get its own test here, or `qmatmul` routes it through `fp8Linear`.
+/// bf16 scales nor MX's u8 ones. Only Sushi's MiMo trunk stores this pair (and an HF block-FP8 pack's
+/// dense projection after its grid broadcasts to per-row scales); the geometry check keeps a different
+/// grid shape from claiming its way into the row kernel.
 pub fn isRowScaledFp8(w: mlx.mlx_array, sc: mlx.mlx_array) bool {
     if (w.ctx == null or sc.ctx == null) return false;
-    return mlx.mlx_array_dtype(w) == .uint8 and mlx.mlx_array_dtype(sc) == .float32;
+    if (mlx.mlx_array_dtype(w) != .uint8 or mlx.mlx_array_dtype(sc) != .float32) return false;
+    const ws = mlx.getShape(w);
+    const ss = mlx.getShape(sc);
+    return ws.len == 2 and ss.len == 2 and ss[0] == ws[0] and ss[1] * FP8_BLOCK == ws[1];
 }
 
 /// A row-scaled e4m3 weight decoded to bf16 `[R, K]`.

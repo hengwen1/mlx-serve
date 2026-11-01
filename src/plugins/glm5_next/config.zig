@@ -54,6 +54,10 @@ pub const Config = struct {
     quant_mode: QuantMode = .affine,
     /// NVIDIA ModelOpt FP4 (`quantization_config.quant_method: modelopt`).
     modelopt: bool = false,
+    /// A block-FP8 export (`quantization_config.quant_method: "fp8"`, `weight_block_size [128, 128]`):
+    /// the load re-encodes its banks affine 8-bit and broadcasts its dense grids to row scales, so the
+    /// residents hold `codes + scales + biases` over the stored bytes (`fp8OverheadBytes`).
+    block_fp8: bool = false,
     attn_output_gate: bool = false,
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = @splat(false),
@@ -312,13 +316,22 @@ pub fn readCommon(c: *Config, o: Objects) ParseError!void {
             else => return error.Unsupported,
         };
     }
-    if (field(root, "quantization_config")) |qc| if (qc == .object) if (qc.object.get("quant_method")) |m| {
-        if (m == .string and std.mem.eql(u8, m.string, "modelopt")) {
-            c.modelopt = true;
-            c.quant_bits = 4;
-            c.quant_group_size = 16;
-            c.quant_mode = .nvfp4;
+    if (field(root, "quantization_config")) |qc| if (qc == .object) {
+        if (qc.object.get("quant_method")) |m| {
+            if (m == .string and std.mem.eql(u8, m.string, "modelopt")) {
+                c.modelopt = true;
+                c.quant_bits = 4;
+                c.quant_group_size = 16;
+                c.quant_mode = .nvfp4;
+            }
         }
+        if (qc.object.get("quant_method")) |m| if (qc.object.get("weight_block_size")) |wbs| {
+            if (m == .string and std.mem.eql(u8, m.string, "fp8") and wbs == .array and wbs.array.items.len == 2) {
+                const lo = wbs.array.items[0];
+                const hi = wbs.array.items[1];
+                c.block_fp8 = lo == .integer and hi == .integer and lo.integer == 128 and hi.integer == 128;
+            }
+        };
     };
     if (field(root, "eos_token_id")) |v| switch (v) {
         .integer => |i| c.addEos(std.math.cast(u32, i) orelse return error.InvalidConfigField),
@@ -686,6 +699,24 @@ test "glm5_next config: an EXL3 streaming pack with fp8 residents parses streame
     defer freeParsed(&p);
     try testing.expect(of(&p).streamed and p.caps.streamed_weights and !p.caps.batches_decode);
 }
+
+test "glm5_next config: a block-FP8 export names itself for the load's re-encode" {
+    var p: abi.Parsed = .{};
+    try testing.expect(parseJson(@embedFile("../../fixtures/model-configs/glm5_next-hf-fp8-block.json"), true, &p).isOk());
+    defer freeParsed(&p);
+    try testing.expect(of(&p).block_fp8);
+
+    // A different block size is not the export's declaration.
+    const fixture = @embedFile("../../fixtures/model-configs/glm5_next-hf-fp8-block.json");
+    const at64 = std.mem.indexOf(u8, fixture, "[128, 128]").?;
+    const swapped = try std.mem.concat(testing.allocator, u8, &.{ fixture[0..at64], "[64, 128]", fixture[at64 + "[128, 128]".len ..] });
+    defer testing.allocator.free(swapped);
+    var p2: abi.Parsed = .{};
+    try testing.expect(parseJson(swapped, true, &p2).isOk());
+    defer freeParsed(&p2);
+    try testing.expect(!of(&p2).block_fp8);
+}
+
 
 test "glm5_next config: a streamed pack, a RoPE'd sparse attention and broken JSON are refused by name" {
     inline for (.{

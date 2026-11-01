@@ -100,6 +100,7 @@ test "glm plugins: discovery reads every fixture pack as the legacy stub reading
         @embedFile("../../fixtures/model-configs/glm5_next-mlx-community-4bit.json"),
         @embedFile("../../fixtures/model-configs/glm5_next-nvidia-fp4-local.json"),
         @embedFile("../../fixtures/model-configs/glm5_next-sushi-2.4bpw.json"),
+        @embedFile("../../fixtures/model-configs/glm5_next-hf-fp8-block.json"),
     }) |json| try expectDiscoveryStub(json, &glm_config.parse);
     // A `_text` pack keeping its vestigial vision block reads as text only.
     const text = try std.mem.replaceOwned(u8, testing.allocator, @embedFile("../../fixtures/model-configs/glm5_next-mlx-community-4bit.json"), "\"model_type\": \"glm5_next\"", "\"model_type\": \"glm5_next_text\"");
@@ -113,10 +114,11 @@ test "glm plugins: discovery reads every fixture pack as the legacy stub reading
     }) |json| try expectDiscoveryStub(json, &ling_config.parse);
 }
 
-test "glm5_next parse: equals the engine's ModelConfig on every GLM-5.3-Flash fixture (MLX, ModelOpt FP4, Sushi)" {
+test "glm5_next parse: equals the engine's ModelConfig on every GLM-5.3-Flash fixture (MLX, ModelOpt FP4, Sushi, HF FP8)" {
     try expectEngineParse(@embedFile("../../fixtures/model-configs/glm5_next-mlx-community-4bit.json"), &glm_config.parse);
     try expectEngineParse(@embedFile("../../fixtures/model-configs/glm5_next-nvidia-fp4-local.json"), &glm_config.parse);
     try expectEngineParse(@embedFile("../../fixtures/model-configs/glm5_next-sushi-2.4bpw.json"), &glm_config.parse);
+    try expectEngineParse(@embedFile("../../fixtures/model-configs/glm5_next-hf-fp8-block.json"), &glm_config.parse);
     // Flat text-only, explicit kda bound and conv width, nulls read as omitted keys.
     try expectEngineParse(
         \\{"model_type":"glm5_next_text","hidden_size":64,"num_hidden_layers":8,"num_attention_heads":4,

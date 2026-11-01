@@ -1,12 +1,12 @@
 # glm5_next plugin
 
-Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4, Sushi EXL3 and EXL3 streaming
-packs) and claims `glm_moe_dsa` to refuse it (GLM-5.3, `plugins/glm_moe_dsa`). Ling 3.0 (`plugins/bailing_hybrid`) shares this plugin's
+Owns `glm5_next`, `glm5_next_text` (GLM-5.3-Flash: mlx-community, NVIDIA ModelOpt FP4, Sushi EXL3, EXL3 streaming and
+HF-transformers block-FP8 packs) and claims `glm_moe_dsa` to refuse it (GLM-5.3, `plugins/glm_moe_dsa`). Ling 3.0 (`plugins/bailing_hybrid`) shares this plugin's
 config readers, trunk (`trunk.zig`), KDA layer (`kda.zig`), slot access (`slots.zig`) and fixture writer.
 
 - Parse: `config.zig` (MLX-free) reads every key the engine's GLM arm reads into `Config`; `model_config.zig` maps it
-  to the engine's `ModelConfig` field for field (`expectEngineParse`: equal on the three GLM fixtures, a flat pack, the
-  refusals, and the file parse with processor + generation config). Refuses: an `expert_streaming` bank other than the EXL3 K=3 mul1 manifest-v2 one, `qk_rope_head_dim`,
+  to the engine's `ModelConfig` field for field (`expectEngineParse`: equal on the four GLM fixtures — MLX, ModelOpt
+  FP4, Sushi, HF FP8 — a flat pack, the refusals, and the file parse with processor + generation config). Refuses: an `expert_streaming` bank other than the EXL3 K=3 mul1 manifest-v2 one, `qk_rope_head_dim`,
   any Gemma/BERT/sliding key (`foreign_keys`), `glm_moe_dsa`.
 - Load (`trunk.zig`): reads the driver's resident source (`LoadCtx.weights`: the engine's map with the Sushi and
   ModelOpt adapters applied) in the layout the deleted legacy load built: q|k|v and the convs joined, GLM's decode row

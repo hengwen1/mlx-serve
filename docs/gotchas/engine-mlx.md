@@ -1341,3 +1341,24 @@ returned `.ok` with no hidden rows, and the driver handed the empty array to the
 `want_hidden` before any forward; the driver fails a hidden-only forward that returns none; the embeddings handler
 refuses a module-owned-state model (`Caps.owns_decode_state`) with a named 400. Guard: `tests/test_dsv41.sh` [7a]
 (refused by name, the next greedy request byte-equal to solo, no `[mlx]` line).
+
+### An HF-transformers FP8 export failed at load under names the plugin never read
+Defect: `orcarouter/GLM-5.3-Flash-Uncensored-FP8` (`quantization_config.quant_method: "fp8"`,
+`weight_block_size [128, 128]`) died on `MISSING WEIGHT: …attn_hc.fn` — after loading 76k tensors. Cause: the
+transformers export renames everything the engine's adapters only fixed for ModelOpt/Sushi/streaming packs: the
+NextN layer sits at `layers.<N>` with `shared_head.norm`, the Sinkhorn tables are `hc_attn_*`/`hc_ffn_*`,
+`kv_b_proj` ships whole, experts are per-expert 2-D tensors in block-FP8 (e4m3 codes x f32 128 x 128 grids — a
+layout MLX's quantized matmuls cannot read, and dequantizing 330 GB to bf16 does not fit the box). Fix:
+`sushi_adapt.adapt` runs the GLM renames for every `isGlm5()` pack (all idempotent), and a `block_fp8` config flag
+(the declared 128 x 128 block; geometry alone can't tell it from a 64 x 128 resident) drives `sdk/weights/
+hf_pack.zig`: per-expert tensors STACK to `[E, R, K]` (`mlx_stack_axis` — concat would flatten the expert axis),
+banks re-encode affine 8-bit on the SAME 128 groups (near-lossless: only the code alphabet changes, and the bank
+rides every affine gather and the fused decode), dense grids broadcast to the per-row scales the row-scaled e4m3
+GEMV reads (codes untouched). Guards: the hf_pack tests (stack order, requant agreement vs the host e4m3 decode,
+exact row-scale expansion) and the sushi_adapt plain-GLM test.
+
+### Two load-time traps the HF fix kept hitting
+`mlx_quantize` affine returns THREE arrays — `[codes, scales, biases]`; synthesizing zero biases over its codes
+mis-decodes every value. And a broadcast/tile output's raw buffer holds only its unique elements: `add(x, 0)`
+folds and passes the view through — the one reliable materializer is a reshape that merges the stride-0 axes
+(dsv4's `toHostF32` note; a bank's flat count passes 2^31, so flatten `[E, R*K]`, not 1-D).

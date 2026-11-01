@@ -120,7 +120,17 @@ fn residentBytes(p: *const abi.Parsed, model_dir: abi.Str, _: abi.Str, shards: u
         out.* = shards +| (@as(u64, c.num_experts_per_tok) * geo.num_moe_layers + streamed.Glm5n.transient_rows) * geo.record_bytes +| mtpBankBytes(model_dir.slice());
         return .ok;
     }
-    if (c.expert_quant_json.len == 0) return .ok;
+    if (c.expert_quant_json.len == 0) {
+        // A block-FP8 export's residents hold its banks' f32 scales and zero biases and its dense
+        // projections' per-row scales over the stored bytes.
+        if (c.block_fp8) {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            const over = @import("../../sdk/weights/hf_pack.zig").fp8OverheadBytes(io, std.heap.page_allocator, model_dir.slice()) catch |err|
+                return Verdict.named(.failed, @errorName(err));
+            out.* = shards + over;
+        }
+        return .ok;
+    }
     const io = std.Io.Threaded.global_single_threaded.io();
     out.* = sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir.slice(), SushiBill{ .layers = c.num_hidden_layers, .kv_lora_rank = c.dsa_kv_lora_rank }) catch |e|
         return Verdict.named(.failed, @errorName(e));
