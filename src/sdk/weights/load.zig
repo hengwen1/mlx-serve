@@ -164,10 +164,96 @@ pub fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std
         return error.NoWeightFiles;
     }
 
+    try pluralizeScaleNames(&weights, allocator);
+    try expandBlockScales(&weights, allocator, s);
     try viewByteAffineWeights(&weights, s);
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
     if (!opts.defer_qwen4_norms) reportF16Narrowing();
     return weights;
+}
+
+/// The block a block-scaled pack shares one scale over, in rows (DeepSeek's official e4m3 releases
+/// use 32 x 32 e8m0 grids).
+pub const BLOCK_SCALE_ROWS: u32 = 32;
+
+/// A pack that scales a whole 32-row block at once (e4m3 codes `[out, in]` + an e8m0 grid
+/// `[out/32, in/32]`) as row-wise gs32 scales: 32 rows sharing a scale IS a row-wise scale, so
+/// the grid is broadcast up (never requantized — e4m3 x 2^k is exact) and the pack keeps its
+/// 8-bit codes as MLX mxfp8, which is the format the plugins' linear paths already read.
+pub fn expandBlockScales(weights: *Weights, allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    var bases: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (bases.items) |b| allocator.free(b);
+        bases.deinit(allocator);
+    }
+    var it = weights.map.iterator();
+    while (it.next()) |e| {
+        if (!std.mem.endsWith(u8, e.key_ptr.*, ".weight")) continue;
+        var buf: [512]u8 = undefined;
+        const base = e.key_ptr.*[0 .. e.key_ptr.*.len - ".weight".len];
+        const sc = weights.map.get(std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue) orelse continue;
+        if (mlx.mlx_array_dtype(sc) != .uint8) continue;
+        const ws = mlx.getShape(e.value_ptr.*);
+        const ss = mlx.getShape(sc);
+        if (ws.len != 2 or ss.len != 2 or ss[0] == 0 or ss[1] == 0) continue;
+        if (ws[0] != ss[0] * @as(c_int, BLOCK_SCALE_ROWS) or ws[1] != ss[1] * 32) continue;
+        try bases.append(allocator, try allocator.dupe(u8, base));
+    }
+    for (bases.items) |base| {
+        var buf: [512]u8 = undefined;
+        const sc_name = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue;
+        const slot = weights.map.getPtr(sc_name) orelse continue;
+        const sc = slot.*;
+        const ss = mlx.getShape(sc);
+        const rows = ss[0] * @as(c_int, BLOCK_SCALE_ROWS);
+        const brow: c_int = @intCast(BLOCK_SCALE_ROWS);
+        var a3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(a3);
+        try mlx.check(mlx.mlx_reshape(&a3, sc, &[_]c_int{ ss[0], 1, ss[1] }, 3, s));
+        const wide = [_]c_int{ ss[0], brow, ss[1] };
+        var b3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(b3);
+        try mlx.check(mlx.mlx_broadcast_to(&b3, a3, &wide, 3, s));
+        var flat = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_reshape(&flat, b3, &[_]c_int{ rows, ss[1] }, 2, s));
+        try mlx.check(mlx.mlx_array_eval(flat));
+        _ = mlx.mlx_array_free(sc);
+        slot.* = flat;
+    }
+}
+
+/// DeepSeek's official releases name a quantized linear's scales beside its `.weight` as `.scale`
+/// (singular, e8m0); every consumer here and in the plugins looks for `.scales`. Rename at load:
+/// a `.scale` with a `.weight` sibling and no `.scales` takes the plural name.
+fn pluralizeScaleNames(weights: *Weights, allocator: std.mem.Allocator) !void {
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var old_keys: std.ArrayList([]const u8) = .empty;
+    defer old_keys.deinit(arena.allocator());
+    var it = weights.map.iterator();
+    while (it.next()) |e| {
+        const key = e.key_ptr.*;
+        if (!std.mem.endsWith(u8, key, ".scale")) continue;
+        const base = key[0 .. key.len - ".scale".len];
+        var buf: [512]u8 = undefined;
+        const sibling = std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch continue;
+        if (weights.map.get(sibling) == null) continue;
+        const plural = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch continue;
+        if (weights.map.get(plural) != null) continue;
+        try old_keys.append(arena.allocator(), key);
+    }
+    for (old_keys.items) |old| {
+        const arr = weights.map.get(old) orelse continue;
+        const base = old[0 .. old.len - ".scale".len];
+        const new_key = try std.fmt.allocPrint(allocator, "{s}.scales", .{base});
+        weights.map.put(new_key, arr) catch {
+            allocator.free(new_key);
+            continue;
+        };
+        _ = weights.map.remove(old);
+        allocator.free(old);
+    }
 }
 
 /// A quantized weight stored as uint8 is MLX's packed uint32 words written byte-wise — affine
@@ -178,7 +264,8 @@ pub fn viewByteAffineWeights(weights: *Weights, s: mlx.mlx_stream) !void {
     var it = weights.map.iterator();
     while (it.next()) |e| {
         const key = e.key_ptr.*;
-        if (!std.mem.endsWith(u8, key, ".weight") or mlx.mlx_array_dtype(e.value_ptr.*) != .uint8) continue;
+        const dt = mlx.mlx_array_dtype(e.value_ptr.*);
+        if (!std.mem.endsWith(u8, key, ".weight") or (dt != .uint8 and dt != .int8)) continue;
         const shape = mlx.getShape(e.value_ptr.*);
         if (shape.len == 0 or @rem(shape[shape.len - 1], 4) != 0) continue;
         const base = key[0 .. key.len - ".weight".len];
@@ -474,6 +561,110 @@ test "dequantizeSmall: an fp-family weight (uint8 scales, no biases) densifies t
     try mlx.check(mlx.mlx_array_eval(qf));
     try mlx.check(mlx.mlx_array_eval(rf));
     try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(qf).?[0 .. 4 * 128], mlx.mlx_array_data_float32(rf).?[0 .. 4 * 128]);
+}
+
+/// e4m3fn code byte -> value (the format both the release and MLX's mxfp8 codes use).
+fn e4m3Value(code: u8) f32 {
+    const sign: f32 = if (code & 0x80 != 0) -1 else 1;
+    const exp: u8 = (code >> 3) & 0xf;
+    const mant: u8 = code & 0x7;
+    if (exp == 0) return sign * @as(f32, @floatFromInt(mant)) / 8.0 * 0.015625; // 2^-6 subnormal
+    if (exp == 0xf and mant == 0x7) return std.math.nan(f32);
+    return sign * std.math.pow(f32, 2, @as(f32, @floatFromInt(@as(i32, exp) - 7))) * (1.0 + @as(f32, @floatFromInt(mant)) / 8.0);
+}
+
+/// e8m0 scale byte -> value (2^(b-127)).
+fn e8m0Value(b: u8) f32 {
+    return std.math.pow(f32, 2, @as(f32, @floatFromInt(@as(i32, b) - 127)));
+}
+
+test "expandBlockScales: the official release's 32x32 e8m0 grid becomes the row-wise gs32 mxfp8 scales MLX reads" {
+    // DeepSeek's official V4.1 pack: e4m3 codes [64, 128] with one e8m0 scale per 32 output rows x 32
+    // input columns, [2, 4]. Thirty-two rows sharing a scale is exactly a row-wise scale, so broadcasting
+    // the grid up keeps the pack's 8-bit codes and is lossless (e4m3 x 2^k is exact in bf16).
+    const rows = 64;
+    const cols = 128;
+    const s = mlx.gpuStream();
+    var codes: [rows * cols]u8 = undefined;
+    const pattern = [_]u8{ 0x38, 0x3c, 0x40, 0xb8, 0x04, 0x7e }; // 1.0, 1.5, 2.0, -1.0, subnormal, max
+    for (&codes, 0..) |*c, i| c.* = pattern[i % 6];
+    var grid: [2 * 4]u8 = undefined;
+    const gvals = [_]u8{ 127, 128, 130, 120, 127, 124, 127, 133 };
+    for (&grid, 0..) |*g, i| g.* = gvals[i];
+    const w = mlx.mlx_array_new_data(&codes, &[_]c_int{ rows, cols }, 2, .uint8);
+    const sc = mlx.mlx_array_new_data(&grid, &[_]c_int{ 2, 4 }, 2, .uint8);
+
+    // The reference: every code times the scale of its 32-row x 32-col block.
+    var want: [rows * cols]f32 = undefined;
+    for (0..rows) |r| for (0..cols) |c| {
+        want[r * cols + c] = e4m3Value(codes[r * cols + c]) * e8m0Value(grid[(r / 32) * 4 + c / 32]);
+    };
+
+    var weights = Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.weight"), w);
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.scale"), sc);
+    try pluralizeScaleNames(&weights, std.testing.allocator);
+    try expandBlockScales(&weights, std.testing.allocator, s);
+    try viewByteAffineWeights(&weights, s);
+    const wv = weights.map.get("t.weight").?;
+    const sv = weights.map.get("t.scales").?;
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(wv));
+    try testing.expectEqualSlices(c_int, &.{ rows, 4 }, mlx.getShape(sv));
+    const qp = quantParamsFromGeometry(wv, sv, false, cols) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 8), qp.bits);
+    try testing.expectEqual(@as(u32, 32), qp.group_size);
+    try testing.expectEqual(@import("../quant/params.zig").QuantMode.mxfp8, qp.mode);
+
+    var got = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_dequantize(&got, wv, sv, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(f32, &want, mlx.mlx_array_data_float32(got).?[0 .. rows * cols]);
+}
+
+test "pluralizeScaleNames + viewByteAffineWeights: DeepSeek's official `.scale` (singular, int8 codes) loads like an MLX pack" {
+    // The official V4.1 release ships every quantized linear as `.weight` codes (e4m3, or
+    // 4-bit nibbles tagged I8) + `.scale` (singular, e8m0). Consumers look for `.scales`
+    // and uint32 words, so the load renames the scale and views the bytes — either tag.
+    const s = mlx.gpuStream();
+    var host: [4 * 128]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) / 6.0 - 1.0;
+    const w = mlx.mlx_array_new_data(&host, &[_]c_int{ 4, 128 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(w);
+    var qv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qv);
+    try mlx.check(mlx.mlx_quantize(&qv, w, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, s));
+    var q = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&q, qv, 0));
+    var sc = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_dequantize(&want, q, sc, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(want));
+
+    // The pack's shape: the words' bytes as I8, scales under the singular name (map owns all three).
+    var bytes = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_view(&bytes, q, .int8, s));
+    var weights = Weights.init(std.testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.weight"), bytes);
+    try weights.map.put(try std.testing.allocator.dupe(u8, "t.scale"), sc);
+    try pluralizeScaleNames(&weights, std.testing.allocator);
+    try testing.expect(weights.map.get("t.scale") == null);
+    try testing.expect(weights.map.get("t.scales") != null);
+    try viewByteAffineWeights(&weights, s);
+    const viewed = weights.map.get("t.weight").?;
+    try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(viewed));
+    const qp = quantParamsFromGeometry(viewed, weights.map.get("t.scales").?, false, 128) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 4), qp.bits);
+    try testing.expectEqual(@import("../quant/params.zig").QuantMode.mxfp4, qp.mode);
+    var got = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_dequantize(&got, viewed, weights.map.get("t.scales").?, .{ .ctx = null }, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", .{ .ctx = null }, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(got));
+    try testing.expectEqualSlices(f32, mlx.mlx_array_data_float32(want).?[0 .. 4 * 128], mlx.mlx_array_data_float32(got).?[0 .. 4 * 128]);
 }
 
 test "viewByteAffineWeights: fp-family bytes (uint8 codes + uint8 scales, no biases) view to uint32 words" {

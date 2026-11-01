@@ -4,8 +4,9 @@ DeepSeek-V4.1-Flash (`model_type: deepseek_v41`, 1M context, MLX packs) with its
 module-owned arch. Resident unpaired captures transfer to the engine's prefix cache, keyed on image rows. Packs:
 `ddalcu/DeepSeek-V4.1-Flash-1017-iQ-MLX-3.0bpw`, `mlx-community/DeepSeek-V4.1-Flash-1017-oQ2.5e-mtp`, and
 OpensourceWTF's streaming repacks (`experts.bin`: routed experts as an EXL3 bank, streamed). oMLX's layered mxfp4
-packs (`model-layers-NN(-engram).safetensors` + per-layer manifests, raw-U8 fp codes, quantized markov tables) load
-too: `engram.openManifestTable`, the fp arm of `viewByteAffineWeights`/`dequantizeSmall`.
+packs (`model-layers-NN(-engram).safetensors` + per-layer manifests, raw-U8 fp codes, quantized markov tables) and
+DeepSeek's own fp8 release (`.scale` singular, e4m3 with a 32x32 e8m0 grid, I8-packed 4-bit experts) load too:
+`engram.openManifestTable`, `load.pluralizeScaleNames` / `expandBlockScales` / `dequantizeSmall`.
 
 ## Files
 - `plugin.zig`: the table; `CacheHooks.aux` / live `state_bytes`; streamed/paired legacy `resume_prompt`;

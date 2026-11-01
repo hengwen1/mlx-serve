@@ -299,6 +299,25 @@ pub const Table = struct {
         const idx = std.json.parseFromSliceLeaky(std.json.Value, a, index_raw, .{}) catch return error.EngramTableMissing;
         const wm = (if (idx == .object) idx.object.get("weight_map") else null) orelse return error.EngramTableMissing;
         if (wm != .object) return error.EngramTableMissing;
+        // DeepSeek's official release: the raw fp8 pair (`.weight` + `.scale`, singular) in one
+        // shard the index names; an affine pack (`.scales` + `.biases`) takes the arm below.
+        {
+            var pair: [2][]const u8 = undefined;
+            var fp8_file: ?[]const u8 = null;
+            var have = true;
+            for ([_][]const u8{ "weight", "scale" }, 0..) |part, i| {
+                pair[i] = try std.fmt.allocPrint(a, "layers.{d}.engram.embed.{s}", .{ layer, part });
+                if (wm.object.get(pair[i]) == null) pair[i] = try std.fmt.allocPrint(a, "{s}{s}", .{ weights_load.dsv41_text_prefix, pair[i] });
+                const f = wm.object.get(pair[i]) orelse {
+                    have = false;
+                    break;
+                };
+                if (f != .string or std.mem.indexOfAny(u8, f.string, "/\\") != null) return error.EngramTableMissing;
+                if (fp8_file) |prev| if (!std.mem.eql(u8, prev, f.string)) return error.EngramTableSplit;
+                fp8_file = f.string;
+            }
+            if (have) return try openFp8Shard(a, dir_path, fp8_file.?, pair[0], pair[1], rows, head_dim);
+        }
         var names: [3][]const u8 = undefined;
         var file: ?[]const u8 = null;
         for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |part, i| {
@@ -1008,6 +1027,47 @@ test "dsv41 engram: a layered oMLX pack's sidecar shard (named by its layer mani
     var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
     defer t.close();
     // The sidecar sits in the pack's dir sum, unlike the repack's engram/ dir: its bytes are billed back off.
+    try testing.expectEqual(@as(u64, 4 * (64 + 2)), t.shardBytes());
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const rows = try t.gather(testing.allocator, &.{ 3, 0 }, s);
+    defer _ = mlx.mlx_array_free(rows);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const v = mlx.mlx_array_data_float32(rows).?;
+    try testing.expectEqual(@as(f32, 8), v[0]);
+    try testing.expectEqual(@as(f32, 0.5), v[63]);
+    try testing.expectEqual(@as(f32, 1), v[64]);
+    try testing.expectEqual(@as(f32, 0.5), v[64 + 32]);
+}
+
+/// DeepSeek's official release: one shard named by `model.safetensors.index.json` holds the
+/// layer's raw fp8 pair (`embed.weight` F8_E4M3 + `embed.scale` F8_E8M0, singular).
+fn writeOfficialIndexFp8Fixture(io: std.Io, dir: std.Io.Dir) !void {
+    const hdr = "{\"layers.1.engram.embed.weight\":{\"dtype\":\"F8_E4M3\",\"shape\":[4,64],\"data_offsets\":[0,256]}," ++
+        "\"layers.1.engram.embed.scale\":{\"dtype\":\"F8_E8M0\",\"shape\":[4,2],\"data_offsets\":[256,264]}}";
+    var shard: [8 + hdr.len + 264]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    const data = shard[8 + hdr.len ..];
+    @memset(data[0..256], 0x38); // e4m3 1.0
+    for (0..4) |r| {
+        data[256 + 2 * r] = @intCast(127 + r); // 2^r for the first 32 columns
+        data[256 + 2 * r + 1] = 126; // 0.5 for the rest
+    }
+    try dir.writeFile(io, .{ .sub_path = "model-00047-of-00048.safetensors", .data = &shard });
+    try dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
+        "\"layers.1.engram.embed.weight\":\"model-00047-of-00048.safetensors\"," ++
+        "\"layers.1.engram.embed.scale\":\"model-00047-of-00048.safetensors\"}}" });
+}
+
+test "dsv41 engram: the official release's fp8 pair, named by the index, opens and bills its bytes" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeOfficialIndexFp8Fixture(io, td.dir);
+    var buf: [512]u8 = undefined;
+    var t = try Table.open(testing.allocator, buf[0..try td.dir.realPath(io, &buf)], 0, 1, 4, 64);
+    defer t.close();
     try testing.expectEqual(@as(u64, 4 * (64 + 2)), t.shardBytes());
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
