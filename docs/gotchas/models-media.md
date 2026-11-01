@@ -459,6 +459,26 @@ dump records the reference's own margins and `Qwen4Ties` acquits by those, never
 selection only through the MTP head's one MoE layer (`--topk 2`, read k back from the checkpoint). Restore parity on
 this arch is the chunking class (~0.3 nats top-5), not the hybrid 0.047. Detail: `src/plugins/qwen4_exp/AGENTS.md`.
 
+### A checkpoint straight out of the training code refuses three ways (Qwen3.8-Flash-Next bf16)
+Defect: the full-precision build (`orcarouter/Qwen3.8-Flash-Next-Uncensored`, 335 GB bf16, no converter in between)
+died at `EmbeddedPleMissing`, then `MISSING WEIGHT: …mlp.switch_mlp.gate_proj.weight`, then Metal's `expected 40960
+input channels but got 10240`. Cause: every prior qwen4 pack had passed through a converter — the table merged into
+`ngram_table.bin` or affine shards, experts split into `mlp.switch_mlp.*`, depthwise convs moved to `[C, K, 1]`. The
+raw checkpoint names none of that: its n-gram rows sit in the shards as bare BF16, gate and up as one fused
+`mlp.experts.gate_up_proj`, and both convs keep torch's `[C, 1, K]`. Fix: the embedded PLE reader takes a raw BF16
+arm (a pack that names no scales holds its rows raw); the MoE binder splits the fused tensor gate-rows-first like
+mlx-lm's converter does; the layered loader runs both convs through the existing depthwise transpose. Guard: the
+`raw BF16 shards`, `fused gate_up_proj`, and `torch-layout depthwise conv` tests.
+
+### Warming a table the weights leave no room for kills the box (low-swap)
+Defect: that same bf16 pack loaded, passed warmup, then the kernel killed the server mid-generation (`killing
+mlx-serve due to low-swap`, 157 GB compressed) — reproducibly, on every run. Cause: the 95 GB n-gram table's
+background page-cache warm ran beside ~385 GB of resident model on a 512 GB Mac; the cache churn evicted and
+compressed everything else until swap ran out. The table itself is already SSD-offloaded (mmap, rows pread on
+demand) — only the warm was fatal. Fix: `startWarm` takes the resident bill and the working set and skips when the
+weights leave less than twice the table's size (`warmFits`), logging the numbers; the cold pread path serves rows
+regardless. Guard: the `warm budget` test; the skip line in any tight load's log.
+
 ## More model ports
 
 ### Spark-X2.5: a later `Digits` rule re-splits the groups

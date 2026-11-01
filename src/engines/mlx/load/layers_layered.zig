@@ -32,8 +32,25 @@ const lastDim = @import("weights.zig").lastDim;
 const layerBase = @import("weights.zig").layerBase;
 const loadQW = @import("weights.zig").loadQW;
 const maybeTransposeForBf16 = @import("weights.zig").maybeTransposeForBf16;
+const maybeTransposeDepthwiseConv = @import("weights.zig").maybeTransposeDepthwiseConv;
 const moeExpertSuffix = @import("weights.zig").moeExpertSuffix;
 const splitPackedGateUp = @import("weights.zig").splitPackedGateUp;
+const expertTriple = @import("weights.zig").expertTriple;
+const fusedGateUp = @import("weights.zig").fusedGateUp;
+const Triple = @import("weights.zig").Triple;
+
+/// One fused gate/up tensor's two halves.
+const GateUp = struct { gate: mlx.mlx_array, up: mlx.mlx_array };
+
+/// Both halves of a fused expert part, materialized (`gather_qmm` reads row-contiguous buffers); the
+/// pair is empty when the pack holds no such part (a bf16 checkpoint names no scales or biases).
+fn splitGateUp(a: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !GateUp {
+    if (a.ctx == null) return .{ .gate = a, .up = a };
+    const half = try splitPackedGateUp(a, s);
+    try owned.append(allocator, half.gate);
+    try owned.append(allocator, half.up);
+    return .{ .gate = half.gate, .up = half.up };
+}
 
 pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !struct { moe_layers: []MoeLayerWeights, ssm_entries: []SSMCacheEntry, owned_bf16: []mlx.mlx_array } {
     log.info("Precomputing MoE layer weights...\n", .{});
@@ -155,6 +172,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 try maybeTransposeForBf16(&la.qkv_w, la.qkv_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
+                try maybeTransposeDepthwiseConv(&la.conv1d_w, &owned_bf16, allocator, s);
             } else {
                 lw.attn = .{ .linear = .{
                     .qkv_w = try getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.weight"),
@@ -183,6 +201,7 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
                 try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
+                try maybeTransposeDepthwiseConv(&la.conv1d_w, &owned_bf16, allocator, s);
                 if (la.qkv_s.ctx != null) {
                     var parts = [_][3]*mlx.mlx_array{ .{ &la.qkv_w, &la.qkv_s, &la.qkv_b }, .{ &la.z_w, &la.z_s, &la.z_b }, .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
                     const names = [_][]const u8{ "linear_attn.in_proj_qkv", "linear_attn.in_proj_z", "linear_attn.in_proj_a", "linear_attn.in_proj_b" };
@@ -472,19 +491,54 @@ pub fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights:
             // An EXL3 pack (src/sdk/quant/exl3) binds trellis/suh/svh in the same slots.
             const leaf: [3][]const u8 = if (config.exl3 != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
             var exbuf: [64]u8 = undefined;
+            // A checkpoint straight out of the training code stacks gate and up into ONE fused
+            // `mlp.experts.gate_up_proj` [E, 2M, K] beside `mlp.experts.down_proj`; mlx-lm's
+            // converter splits it into `mlp.switch_mlp.{gate,up}_proj.weight`, so split it the same
+            // way here rather than refusing the pack. Such a checkpoint carries no per-expert
+            // routing scales, so those three lookups below stay on `mlp.switch_mlp`.
+            const fused = if (config.exl3 == null) fusedGateUp(weights, name_buf, prefix, li) else null;
+            var gate: Triple = undefined;
+            var up: Triple = undefined;
+            var down: Triple = undefined;
+            if (fused) |f| {
+                const halves = [3]GateUp{
+                    try splitGateUp(f.w, &owned_bf16, allocator, s),
+                    try splitGateUp(f.s, &owned_bf16, allocator, s),
+                    try splitGateUp(f.b, &owned_bf16, allocator, s),
+                };
+                gate = .{ .w = halves[0].gate, .s = halves[1].gate, .b = halves[2].gate };
+                up = .{ .w = halves[0].up, .s = halves[1].up, .b = halves[2].up };
+                down = try expertTriple(weights, name_buf, prefix, li, "mlp.experts.down_proj");
+            } else {
+                gate = .{
+                    .w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[0])),
+                    .s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[1])) orelse mlx.mlx_array_new(),
+                    .b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[2])) orelse mlx.mlx_array_new(),
+                };
+                up = .{
+                    .w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[0])),
+                    .s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[1])) orelse mlx.mlx_array_new(),
+                    .b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[2])) orelse mlx.mlx_array_new(),
+                };
+                down = .{
+                    .w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[0])),
+                    .s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[1])) orelse mlx.mlx_array_new(),
+                    .b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[2])) orelse mlx.mlx_array_new(),
+                };
+            }
             lw.mlp = .{ .moe = .{
                 .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[0])),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[1])) orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", leaf[2])) orelse mlx.mlx_array_new(),
-                .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[0])),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[1])) orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", leaf[2])) orelse mlx.mlx_array_new(),
-                .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[0])),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[1])) orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", leaf[2])) orelse mlx.mlx_array_new(),
+                .switch_gate_w = gate.w,
+                .switch_gate_s = gate.s,
+                .switch_gate_b = gate.b,
+                .switch_up_w = up.w,
+                .switch_up_s = up.s,
+                .switch_up_b = up.b,
+                .switch_down_w = down.w,
+                .switch_down_s = down.s,
+                .switch_down_b = down.b,
                 .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),

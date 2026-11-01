@@ -149,6 +149,16 @@ fn warmEnabled() bool {
     return warm_override orelse true;
 }
 
+/// The page-cache warm holds the WHOLE table beside the wired weights, so it is worth running only
+/// when the weights leave at least twice the table's size of working set (the other half is
+/// transients, KV, and everything else on the machine). Past that, warming 95 GB of cache beside a
+/// full trunk is what tips the box into compression and the kernel's low-swap kill; the cold path
+/// (the pread workers) serves rows off the SSD on demand either way.
+pub fn warmFits(model_bytes: u64, table_bytes: u64, working_set: u64) bool {
+    const spare = working_set -| model_bytes;
+    return spare / 2 >= table_bytes + ple_gpu.HEADROOM;
+}
+
 /// Process-wide under `-Dunits` (sdk/util/shared.zig): one copy in the host.
 const WarmState = struct {
     /// What the background page-cache warm has read so far, and the table's total size. Published
@@ -464,8 +474,10 @@ pub const NgramTable = struct {
 
     /// Read the whole table through its fds once, in the background, so the
     /// first prompt's PLE gathers hit a warm page cache. Call only once the
-    /// table sits at its final address (the thread holds `self`).
-    pub fn startWarm(self: *NgramTable) void {
+    /// table sits at its final address (the thread holds `self`). `model_bytes`
+    /// is the resident weight bill and `working_set` the machine's: the warm
+    /// skips when they leave no room to hold the table.
+    pub fn startWarm(self: *NgramTable, model_bytes: u64, working_set: u64) void {
         if (self.warmRegion(0) == null or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
@@ -475,6 +487,10 @@ pub const NgramTable = struct {
         var total: u64 = 0;
         var i: usize = 0;
         while (self.warmRegion(i)) |r| : (i += 1) total += r.len;
+        if (!warmFits(model_bytes, total, working_set)) {
+            log.info("[qwen4] ngram table warm: skipped - weights {d:.1} GB + table {d:.1} GB leave {d:.1} GB of working set; rows read from SSD on demand\n", .{ asGb(model_bytes), asGb(total), asGb(working_set -| model_bytes) });
+            return;
+        }
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
         warmBytes().live_warm_bytes.store(0, .release);
@@ -525,11 +541,7 @@ pub const NgramTable = struct {
         }
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
-            const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
-            var i: u32 = 0;
-            while (i < self.dim) : (i += 1) {
-                out[i] = bf16ToF32(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little));
-            }
+            rawBf16Row(self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2], out[0..self.dim]);
             return;
         }
         const words = self.map[self.w_off + r * self.wcols * 4 ..][0 .. self.wcols * 4];
@@ -539,6 +551,7 @@ pub const NgramTable = struct {
     }
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
+        if (self.fmt == .raw) return rawBf16Row(words, out[0..self.dim]);
         if (self.fmt == .nvfp4) return dequantNvfp4Row(words, scales, self.embedded.?.scale, out[0..self.dim]);
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
         // An embedded pack's global weight scale; 1.0 leaves every other table exact.
@@ -608,6 +621,11 @@ const E4M3: [256]f32 = blk: {
     }
     break :blk t;
 };
+
+/// A raw BF16 row read out of `raw`: the same values the quantized arms dequantize to, no group math.
+fn rawBf16Row(raw: []const u8, out: []f32) void {
+    for (out, 0..) |*v, i| v.* = bf16ToF32(std.mem.readInt(u16, raw[i * 2 ..][0..2], .little));
+}
 
 /// One NVFP4 row: e2m1 codes low nibble first, an e4m3 scale per 16, times the table's global scale.
 fn dequantNvfp4Row(codes: []const u8, scales: []const u8, global: f32, out: []f32) void {
@@ -1009,6 +1027,22 @@ test "embedded PLE reads a ModelOpt NVFP4 table in a subdirectory" {
     }
 }
 
+test "embedded PLE raw BF16 shards gather bit-exact rows through the table reader" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeRawFixture(&td);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 3, .dim = 32, .shards = 2 });
+    defer table.close();
+    try testing.expectEqual(@as(u32, 16), table.bits);
+    try testing.expectEqual(embedded_ple.Format.raw, table.fmt);
+    var out: [96]f32 = undefined;
+    table.gather(&.{ 2, 0, 1 }, &out, 1 << 20);
+    for ([_]usize{ 2, 0, 1 }, 0..) |r, k| for (0..32) |c| try testing.expectEqual(bf16ToF32(embedded_ple.rawFixtureBits(r, c)), out[k * 32 + c]);
+}
+
 test "embedded PLE refuses an NVFP4 table whose group is not 16" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
@@ -1294,7 +1328,7 @@ test "ngram prefill gather: 4096 rows through the pool equal the direct mmap rea
     ple_prefill_prefetch_override = null;
     warm_override = true;
     const before_warm = pool.runs.load(.monotonic);
-    t.startWarm();
+    t.startWarm(0, 1 << 40);
     (t.warm_thread orelse return error.WarmThreadMissing).join();
     t.warm_thread = null;
     try testing.expectEqual(before_warm, pool.runs.load(.monotonic));
@@ -1339,7 +1373,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     warm_override = true;
     defer warm_override = null;
     var t = try NgramTable.open(path);
-    t.startWarm();
+    t.startWarm(0, 1 << 40);
     try testing.expect(t.warm_thread != null);
     var spins: u32 = 0;
     while (t.warm_bytes.load(.acquire) < buf.len) : (spins += 1) {
@@ -1352,7 +1386,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
 
     // close() during the warm joins instead of racing the fd/munmap.
     var t2 = try NgramTable.open(path);
-    t2.startWarm();
+    t2.startWarm(0, 1 << 40);
     t2.close();
 
     // An embedded pack warms every shard part through its own file.
@@ -1361,7 +1395,7 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     try embedded_ple.writeFixture(&etd, .valid);
     const elen = try etd.dir.realPath(io, &pbuf);
     var te = try NgramTable.openEmbedded(pbuf[0..elen], .{ .rows = 6, .dim = 32, .shards = 3 });
-    te.startWarm();
+    te.startWarm(0, 1 << 40);
     (te.warm_thread orelse return error.WarmThreadMissing).join();
     te.warm_thread = null;
     try testing.expectEqual(te.embeddedPayloadBytes(), te.warm_bytes.load(.acquire));
@@ -1370,9 +1404,27 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     // Kill switch: no thread.
     warm_override = false;
     var t3 = try NgramTable.open(path);
-    t3.startWarm();
+    t3.startWarm(0, 1 << 40);
     try testing.expect(t3.warm_thread == null);
     t3.close();
+
+    // No machine budget: no thread, either — the weights already crowd the cache
+    // (the low-swap kill class), so the cold pread path serves rows on demand.
+    var t4 = try NgramTable.open(path);
+    t4.startWarm(1 << 40, 1 << 40);
+    try testing.expect(t4.warm_thread == null);
+    t4.close();
+}
+
+test "ngram table warm budget: hold the table only when the weights leave room for it" {
+    // A 512 GB-class Mac serving the bf16 Flash-Next: 240 GB wired leaves 144 GB of working set —
+    // a 95 GB table cannot be held beside it, and warming it is the low-swap kill class.
+    try testing.expect(!warmFits(240 << 30, 95 << 30, 384 << 30));
+    // The same pack on a 1 TB machine, and a quantized pack beside roomy weights: hold it.
+    try testing.expect(warmFits(240 << 30, 95 << 30, 768 << 30));
+    try testing.expect(warmFits(52 << 30, 32 << 30, 384 << 30));
+    // A working set smaller than the weights leaves nothing to warm into.
+    try testing.expect(!warmFits(400 << 30, 4 << 30, 384 << 30));
 }
 
 /// A whole `ngram_table.bin` image in one page-aligned buffer. Caller frees with the page allocator.

@@ -1,13 +1,15 @@
-//! The n-gram table embedded in the pack's own shards (oMLX's affine, NVIDIA's NVFP4): index and header reading,
-//! geometry and overlap checks, the payload it bills, and the region reads the gather uses.
+//! The n-gram table embedded in the pack's own shards (oMLX's affine, NVIDIA's NVFP4, a full-precision
+//! checkpoint's raw BF16 rows): index and header reading, geometry and overlap checks, the payload it
+//! bills, and the region reads the gather uses.
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 
 pub const EmbeddedSpec = struct { rows: u64, dim: u32, shards: u32, layer_index: u32 = 1 };
 pub const EmbeddedInfo = struct { payload_bytes: u64 };
 const prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.";
-/// oMLX's affine shards and NVIDIA ModelOpt's NVFP4 shards (e2m1 codes, e4m3 scale per 16).
-pub const Format = enum { affine, nvfp4 };
+/// oMLX's affine shards, NVIDIA ModelOpt's NVFP4 shards (e2m1 codes, e4m3 scale per 16), and raw
+/// BF16 rows: the same table straight out of a full-precision checkpoint, named by no scales at all.
+pub const Format = enum { affine, nvfp4, raw };
 const Spelling = struct { layer_prefix: []const u8, shard_marker: []const u8, scale_marker: []const u8, fmt: Format };
 const spellings = [_]Spelling{
     .{ .layer_prefix = "language_model.model.layers.", .shard_marker = ".ple.ple_embedding.ngram_embedding.shards.", .scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale", .fmt = .affine },
@@ -19,8 +21,30 @@ const Part = enum(u2) { weight, scales, biases };
 const Key = struct { layer: u32, shard: u32, part: Part, fmt: Format };
 
 fn parseKey(name: []const u8) ?Key {
-    for (spellings) |sp| if (parseKeyAs(name, sp)) |k| return k;
+    for (spellings) |sp| if (parseKeyAs(name, sp, sp.fmt)) |k| return k;
     return null;
+}
+
+/// The shard part `name` names in a table of format `form`. A raw pack names weights only, so its
+/// row is whichever shard spelling the name fits.
+fn parseKeyForm(name: []const u8, form: Format) ?Key {
+    for (spellings) |sp| if (form == .raw or sp.fmt == form) {
+        if (parseKeyAs(name, sp, form)) |k| return k;
+    };
+    return null;
+}
+
+/// The format an index declares: affine triplets or NVFP4 per-shard scales name themselves, and a
+/// pack that names neither holds its rows raw.
+fn indexFormat(map: *const std.json.ObjectMap) Format {
+    var it = map.iterator();
+    while (it.next()) |e| {
+        if (isScaleName(e.key_ptr.*)) |sf| return sf;
+        for (spellings) |sp| if (parseKeyAs(e.key_ptr.*, sp, sp.fmt)) |k| {
+            if (k.part != .weight) return sp.fmt;
+        };
+    }
+    return .raw;
 }
 
 fn isScaleName(name: []const u8) ?Format {
@@ -28,7 +52,13 @@ fn isScaleName(name: []const u8) ?Format {
     return null;
 }
 
-fn parseKeyAs(name: []const u8, sp: Spelling) ?Key {
+/// The row that names a format's global scale (affine and NVFP4 name one, raw names none).
+fn spellingOf(form: Format) Spelling {
+    for (spellings) |sp| if (sp.fmt == form) return sp;
+    unreachable; // a format with no spelling row
+}
+
+fn parseKeyAs(name: []const u8, sp: Spelling, form: Format) ?Key {
     const layer_prefix = sp.layer_prefix;
     const shard_marker = sp.shard_marker;
     if (!std.mem.startsWith(u8, name, layer_prefix)) return null;
@@ -41,7 +71,7 @@ fn parseKeyAs(name: []const u8, sp: Spelling) ?Key {
     if (dot == 0 or (dot > 1 and rest[0] == '0')) return null;
     const shard = std.fmt.parseInt(u32, rest[0..dot], 10) catch return null;
     const leaf = rest[dot + 1 ..];
-    const part: Part = if (std.mem.eql(u8, leaf, "weight")) .weight else if (std.mem.eql(u8, leaf, if (sp.fmt == .nvfp4) "weight_scale" else "scales")) .scales else if (sp.fmt == .affine and std.mem.eql(u8, leaf, "biases")) .biases else return null;
+    const part: Part = if (std.mem.eql(u8, leaf, "weight")) .weight else if (form == .raw) return null else if (std.mem.eql(u8, leaf, if (sp.fmt == .nvfp4) "weight_scale" else "scales")) .scales else if (sp.fmt == .affine and std.mem.eql(u8, leaf, "biases")) .biases else return null;
     return .{ .layer = layer, .shard = shard, .part = part, .fmt = sp.fmt };
 }
 
@@ -55,17 +85,25 @@ pub fn scaleBytes(fmt: Format) usize {
 }
 
 pub fn partCount(fmt: Format) usize {
-    return if (fmt == .nvfp4) 2 else 3;
+    return switch (fmt) { .affine => 3, .nvfp4 => 2, .raw => 1 };
+}
+
+/// A part's storage: raw rows hold the values themselves, the quantized formats their codes and scales.
+fn partType(form: Format, p: usize) struct { dtype: []const u8, elem: u64 } {
+    if (form == .nvfp4) return if (p == 0) .{ .dtype = "U8", .elem = 1 } else .{ .dtype = "F8_E4M3", .elem = 1 };
+    if (form == .raw) return .{ .dtype = "BF16", .elem = 2 };
+    return if (p == 0) .{ .dtype = "U32", .elem = 4 } else .{ .dtype = "BF16", .elem = 2 };
 }
 
 /// The width `wcols` u32 words pack `dim` values at: any affine width `mx.quantize` writes
-/// (the table's dim is known, so the words alone decide it), NVFP4 always 4.
+/// (the table's dim is known, so the words alone decide it), NVFP4 always 4, raw always 16.
 fn packedBits(form: Format, wcols: u32, dim: u32) ?u32 {
     const total = @as(u64, wcols) * 32;
     if (dim == 0 or total % dim != 0) return null;
     return switch (total / dim) {
         4 => 4,
         2, 3, 5, 6, 8 => |b| if (form == .affine) @intCast(b) else null,
+        16 => if (form == .raw) 16 else null,
         else => null,
     };
 }
@@ -187,10 +225,11 @@ pub const EmbeddedTable = struct {
         const p = where.shard.parts;
         const wlen: usize = self.wcols * 4;
         const slen: usize = self.scols * scaleBytes(self.fmt);
+        const n = partCount(self.fmt);
         return .{
             .weight = self.files[p[0].file].map[p[0].off + where.local * wlen ..][0..wlen],
-            .scales = self.files[p[1].file].map[p[1].off + where.local * slen ..][0..slen],
-            .biases = if (self.fmt == .nvfp4) &.{} else self.files[p[2].file].map[p[2].off + where.local * slen ..][0..slen],
+            .scales = if (n > 1) self.files[p[1].file].map[p[1].off + where.local * slen ..][0..slen] else &.{},
+            .biases = if (n > 2) self.files[p[2].file].map[p[2].off + where.local * slen ..][0..slen] else &.{},
         };
     }
 
@@ -295,7 +334,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     if (weights != .object) return error.EmbeddedPleIndex;
     const candidates = try a.alloc(Candidate, expected.shards);
     for (candidates) |*c| c.* = .{};
-    var fmt: ?Format = null;
+    const form = indexFormat(&weights.object);
     var scale_name: []const u8 = "";
     var scale_file: ?[]const u8 = null;
     var found: usize = 0;
@@ -303,20 +342,17 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
         if (isScaleName(name)) |sf| {
-            if (fmt != null and fmt.? != sf) return error.EmbeddedPleIndex;
-            fmt = sf;
-            const sp = spellings[@backingInt(sf)];
+            if (sf != form) return error.EmbeddedPleIndex;
+            const sp = spellingOf(sf);
             if (!std.mem.eql(u8, name, try std.fmt.allocPrint(a, "{s}{d}{s}", .{ sp.layer_prefix, expected.layer_index, sp.scale_marker })) or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
             scale_name = name;
             scale_file = entry.value_ptr.string;
             continue;
         }
-        const key = parseKey(name) orelse {
+        const key = parseKeyForm(name, form) orelse {
             for (spellings) |sp| if (std.mem.startsWith(u8, name, sp.layer_prefix) and std.mem.indexOf(u8, name, sp.shard_marker) != null) return error.EmbeddedPleIndex;
             continue;
         };
-        if (fmt != null and fmt.? != key.fmt) return error.EmbeddedPleIndex;
-        fmt = key.fmt;
         if (key.layer != expected.layer_index or key.shard >= expected.shards or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
         const part = @backingInt(key.part);
         const c = &candidates[key.shard];
@@ -329,7 +365,6 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         arena.deinit();
         return null;
     }
-    const form = fmt.?;
     const nparts = partCount(form);
     if (found != @as(usize, expected.shards) * nparts) return error.EmbeddedPleMissing;
     var files: std.ArrayList(File) = .empty;
@@ -356,22 +391,26 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
                 try file_ids.put(a, file_name, next);
                 break :blk next;
             };
-            parts[p] = if (form == .nvfp4)
-                try tensor(files.items[id], id, name, if (p == 0) "U8" else "F8_E4M3", 1)
-            else
-                try tensor(files.items[id], id, name, if (p == 0) "U32" else "BF16", if (p == 0) 4 else 2);
+            const pt = partType(form, p);
+            parts[p] = try tensor(files.items[id], id, name, pt.dtype, pt.elem);
             payload = std.math.add(u64, payload, parts[p].len) catch return error.EmbeddedPleRegion;
         }
         if (form == .nvfp4) {
             if (parts[0].cols % 4 != 0) return error.EmbeddedPleGeometry;
             parts[0].cols /= 4;
             parts[2] = .{ .file = parts[0].file, .off = parts[0].off, .len = 0, .rows = parts[0].rows, .cols = 0 };
+        } else if (form == .raw) {
+            // The rows ARE the values: two per word, and no scale or bias region to read.
+            if (parts[0].cols % 2 != 0) return error.EmbeddedPleGeometry;
+            parts[0].cols /= 2;
+            parts[1] = .{ .file = parts[0].file, .off = parts[0].off, .len = 0, .rows = parts[0].rows, .cols = 0 };
+            parts[2] = parts[1];
         }
         if (parts[0].rows != parts[1].rows or parts[0].rows != parts[2].rows or (form == .affine and parts[1].cols != parts[2].cols)) return error.EmbeddedPleRegion;
-        if (packedBits(form, parts[0].cols, expected.dim) == null or parts[1].cols == 0 or expected.dim % parts[1].cols != 0) return error.EmbeddedPleGeometry;
-        const gs = expected.dim / parts[1].cols;
+        if (packedBits(form, parts[0].cols, expected.dim) == null or (form != .raw and (parts[1].cols == 0 or expected.dim % parts[1].cols != 0))) return error.EmbeddedPleGeometry;
+        const gs = if (form == .raw) 0 else expected.dim / parts[1].cols;
         // The NVFP4 readers (CPU dequant, GPU gather) are written for 16-value groups only.
-        if (gs == 0 or gs > 1024 or (form == .nvfp4 and gs != 16) or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
+        if ((form != .raw and (gs == 0 or gs > 1024)) or (form == .nvfp4 and gs != 16) or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
         for (parts[0..nparts], 0..) |p, x| for (parts[0..x]) |q| {
             if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
@@ -501,6 +540,29 @@ pub fn writeNvfp4FixtureGroups(td: *std.testing.TmpDir, comptime wide: bool) !vo
     std.mem.writeInt(u32, data[56..60], @bitCast(@as(f32, 0.5)), .little);
     try td.dir.createDirPath(io, "tensors");
     try writeSafetensors(td, "tensors/a.safetensors", header, &data);
+}
+
+/// Row `r`, column `c` of `writeRawFixture`: distinct bf16 patterns, all finite.
+pub fn rawFixtureBits(r: usize, c: usize) u16 {
+    return 0x3F80 + @as(u16, @intCast(r * 32 + c));
+}
+
+/// HF's full-precision checkpoint: the table as RAW BF16 shard rows, no scales named anywhere.
+/// Rows 0-1 in shard 0, row 2 in shard 1, dim 32.
+pub fn writeRawFixture(td: *std.testing.TmpDir) !void {
+    const a = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const p = "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.";
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"" ++ p ++ "shard_0.weight\":\"a.safetensors\",\"" ++ p ++ "shard_1.weight\":\"b.safetensors\"}}" });
+    for ([_]struct { name: []const u8, rows: usize, first: usize, head: []const u8 }{
+        .{ .name = "a.safetensors", .rows = 2, .first = 0, .head = "{\"" ++ p ++ "shard_0.weight\":{\"dtype\":\"BF16\",\"shape\":[2,32],\"data_offsets\":[0,128]}}" },
+        .{ .name = "b.safetensors", .rows = 1, .first = 2, .head = "{\"" ++ p ++ "shard_1.weight\":{\"dtype\":\"BF16\",\"shape\":[1,32],\"data_offsets\":[0,64]}}" },
+    }) |shard| {
+        const data = try a.alloc(u8, shard.rows * 64);
+        defer a.free(data);
+        for (0..shard.rows) |r| for (0..32) |c| std.mem.writeInt(u16, data[(r * 32 + c) * 2 ..][0..2], rawFixtureBits(shard.first + r, c), .little);
+        try writeSafetensors(td, shard.name, shard.head, data);
+    }
 }
 
 fn writeSafetensors(td: *std.testing.TmpDir, name: []const u8, header: []const u8, data: []const u8) !void {
@@ -663,4 +725,53 @@ test "embedded PLE reads TensorFold affine shard_ names with the same rows and s
     for (0..6) |r| try std.testing.expectEqual(@as(u8, @intCast(r * 0x11)), table.rowParts(r).weight[0]);
     try std.testing.expect(embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight"));
     try std.testing.expect(parseKey("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shard_01.weight") == null);
+}
+
+test "embedded PLE reads a full-precision checkpoint's raw BF16 shards" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFixture(&td);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    const spec: EmbeddedSpec = .{ .rows = 3, .dim = 32, .shards = 2 };
+    const info = (try inspectEmbedded(path, spec)).?;
+    try std.testing.expectEqual(@as(u64, 3 * 64), info.payload_bytes);
+    var t = (try openEmbedded(path, spec)).?;
+    defer t.close();
+    try std.testing.expectEqual(Format.raw, t.fmt);
+    try std.testing.expectEqual(@as(u32, 16), t.bits);
+    try std.testing.expectEqual(@as(u32, 16), t.wcols);
+    try std.testing.expectEqual(@as(u32, 0), t.scols);
+    try std.testing.expectEqual(@as(f32, 1), t.scale);
+    for (0..3) |r| {
+        const parts = t.rowParts(r);
+        try std.testing.expectEqual(@as(usize, 64), parts.weight.len);
+        try std.testing.expectEqual(@as(usize, 0), parts.scales.len);
+        try std.testing.expectEqual(@as(usize, 0), parts.biases.len);
+        for (0..32) |c| try std.testing.expectEqual(rawFixtureBits(r, c), std.mem.readInt(u16, parts.weight[c * 2 ..][0..2], .little));
+        var w: [64]u8 = undefined;
+        try std.testing.expect(t.preadPart(r, 0, &w));
+        try std.testing.expectEqualSlices(u8, parts.weight, &w);
+    }
+    try std.testing.expect(t.region(1) != null);
+    try std.testing.expect(t.region(2) == null);
+    try std.testing.expectEqual(@as(u64, 192), t.repackedLen());
+    var buf: [192]u8 = undefined;
+    try t.repackInto(&buf);
+    for (0..3) |r| try std.testing.expectEqualSlices(u8, t.rowParts(r).weight, buf[r * 64 ..][0..64]);
+}
+
+test "embedded PLE refuses a raw BF16 shard whose rows do not match the config" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeRawFixture(&td);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = path_buf[0..try td.dir.realPath(io, &path_buf)];
+    // One row short of the config's 3, and a dim the config does not ask for.
+    try std.testing.expectError(error.EmbeddedPleGeometry, openEmbedded(path, .{ .rows = 4, .dim = 32, .shards = 2 }));
+    try std.testing.expectError(error.EmbeddedPleGeometry, openEmbedded(path, .{ .rows = 3, .dim = 30, .shards = 2 }));
+    // A pack whose index names fewer shards than the config's count is incomplete, not raw.
+    try std.testing.expectError(error.EmbeddedPleMissing, openEmbedded(path, .{ .rows = 3, .dim = 32, .shards = 3 }));
 }

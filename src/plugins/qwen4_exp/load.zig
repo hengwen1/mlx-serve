@@ -5,6 +5,7 @@ const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const Weights = @import("../../sdk/config/model.zig").Weights;
 const getLayerWeight = @import("../../engines/mlx/load/weights.zig").getLayerWeight;
+const maybeTransposeDepthwiseConv = @import("../../engines/mlx/load/weights.zig").maybeTransposeDepthwiseConv;
 const groupedNormView = @import("../../engines/mlx/load/weights.zig").groupedNormView;
 const scaleTriple = @import("../../engines/mlx/load/weights.zig").scaleTriple;
 const transposeBf16Weight = @import("../../engines/mlx/load/weights.zig").transposeBf16Weight;
@@ -76,7 +77,7 @@ pub fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []con
     var nb: [160]u8 = undefined;
     const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);
     const value = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.value_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);
-    return .{
+    var out: PleWeights = .{
         .key_w = key.w,
         .key_s = key.sc,
         .key_b = key.bi,
@@ -88,4 +89,7 @@ pub fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []con
         .norm_conv = try groupedNormView(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.norm_conv.weight", .{ prefix, li }) catch unreachable, hc, hidden, owned_bf16, allocator, s),
         .conv_w = try getLayerWeight(weights, name_buf, prefix, li, "ple.conv1d.weight"),
     };
+    // The same torch-layout mercy the trunk's GDN conv gets: an HF checkpoint stores [C, 1, K].
+    try maybeTransposeDepthwiseConv(&out.conv_w, owned_bf16, allocator, s);
+    return out;
 }

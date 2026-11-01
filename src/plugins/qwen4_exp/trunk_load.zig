@@ -244,7 +244,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, config: *const model.ModelConfig, 
         st.gpu = ple_gpu.load(&st.table, ple_gpu.pleGpu().enabled, weights_bytes);
         if (st.gpu == null) st.table.calibrateArm();
         // The weights load just evicted the table from page cache; an embedded pack's GPU arm holds its own copy.
-        if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
+        if (st.gpu == null or st.table.embedded == null) st.table.startWarm(weights_bytes, mlx.maxRecommendedWorkingSet());
     }
     // A pipeline split's head would read the last layer's stream, which lives on the worker.
     var head = if (config.dist_span != null) null else try loadQwen4Mtp(a, config.*, weights, &name_buf, s);

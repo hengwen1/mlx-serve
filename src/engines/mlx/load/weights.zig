@@ -374,6 +374,34 @@ pub fn moeExpertSuffix(buf: []u8, container: []const u8, leaf: []const u8) []con
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ container, leaf }) catch unreachable;
 }
 
+pub const Triple = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array };
+
+/// The fused gate/up expert tensor a torch checkpoint stacks as ONE `[E, 2M, K]` array: mlx-lm's
+/// converter splits it into `mlp.switch_mlp.{gate,up}_proj.weight`, a checkpoint straight out of
+/// training names it `mlp.experts.gate_up_proj` (`.weight` once quantized) and keeps the gate rows
+/// first. Null when the pack names its experts per projection.
+pub fn fusedGateUp(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, layer: u32) ?Triple {
+    const w = getLayerWeightOpt(weights, name_buf, prefix, layer, "mlp.experts.gate_up_proj") orelse
+        getLayerWeightOpt(weights, name_buf, prefix, layer, "mlp.experts.gate_up_proj.weight") orelse return null;
+    return .{
+        .w = w,
+        .s = getLayerWeightOpt(weights, name_buf, prefix, layer, "mlp.experts.gate_up_proj.scales") orelse mlx.mlx_array_new(),
+        .b = getLayerWeightOpt(weights, name_buf, prefix, layer, "mlp.experts.gate_up_proj.biases") orelse mlx.mlx_array_new(),
+    };
+}
+
+/// One expert projection stored under `base`: a dense checkpoint names the tensor itself, a quantized
+/// one `base.weight`. Scales and biases are optional either way (a bf16 layer ships neither).
+pub fn expertTriple(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, layer: u32, base: []const u8) error{ MissingWeight }!Triple {
+    var nb: [128]u8 = undefined;
+    const bare = getLayerWeightOpt(weights, name_buf, prefix, layer, base) != null;
+    return .{
+        .w = try getLayerWeight(weights, name_buf, prefix, layer, if (bare) base else moeExpertSuffix(&nb, base, "weight")),
+        .s = getLayerWeightOpt(weights, name_buf, prefix, layer, moeExpertSuffix(&nb, base, "scales")) orelse mlx.mlx_array_new(),
+        .b = getLayerWeightOpt(weights, name_buf, prefix, layer, moeExpertSuffix(&nb, base, "biases")) orelse mlx.mlx_array_new(),
+    };
+}
+
 /// Fetch a quantization scale/bias tensor, tolerant of dense bf16 models.
 /// quant_bits == 0 ⇒ dense bf16 (no .scales/.biases exist anywhere) ⇒ return a
 /// null-ctx array, which downstream code (qmatmulBits, gatherExpertMm, append
@@ -421,6 +449,27 @@ pub fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 
 // ── tests ──
 
+test "a torch-layout depthwise conv weight is swapped to [C, K, 1] at load" {
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer owned.deinit(alloc);
+    // [C, 1, K] torch layout: the conv would demand C*K input channels (the load-killing class).
+    var w = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&w, &[_]c_int{ 8, 1, 4 }, 3, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(w));
+    try maybeTransposeDepthwiseConv(&w, &owned, alloc, s);
+    try testing.expectEqualSlices(c_int, &.{ 8, 4, 1 }, mlx.getShape(w));
+    // An MLX-layout weight is its own transpose and stays untouched.
+    var ok = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_ones(&ok, &[_]c_int{ 8, 4, 1 }, 3, .bfloat16, s));
+    try mlx.check(mlx.mlx_array_eval(ok));
+    try maybeTransposeDepthwiseConv(&ok, &owned, alloc, s);
+    try testing.expectEqualSlices(c_int, &.{ 8, 4, 1 }, mlx.getShape(ok));
+    _ = mlx.mlx_array_free(w);
+    _ = mlx.mlx_array_free(ok);
+}
+
 test "floatDtypeTable: float tables are dense, packed/quantized ones are not" {
     try std.testing.expect(floatDtypeTable(.bfloat16));
     try std.testing.expect(floatDtypeTable(.float16));
@@ -436,6 +485,49 @@ test "a missing weight is a load ERROR, not a process exit (issue #217)" {
     var buf: [256]u8 = undefined;
     try std.testing.expectError(error.MissingWeight, getLayerWeight(&w, &buf, "model", 0, "mlp.w1.weight"));
     try std.testing.expectError(error.MissingWeight, getWeightFmt(&w, &buf, "{s}.norm.weight", "model"));
+}
+
+test "expert naming: a checkpoint's fused gate_up_proj and either suffix style are read" {
+    var buf: [256]u8 = undefined;
+    const put = struct {
+        fn add(w: *model_mod.Weights, key: []const u8) !void {
+            var one: f32 = 1;
+            try w.map.put(try w.allocator.dupe(u8, key), mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32));
+        }
+    }.add;
+    {
+        // torch's layout: the stacked tensor is named without a suffix, and there are no scales.
+        var w = model_mod.Weights.init(std.testing.allocator);
+        defer w.deinit();
+        try put(&w, "model.layers.1.mlp.experts.gate_up_proj");
+        const f = fusedGateUp(&w, &buf, "model", 1).?;
+        try std.testing.expect(f.w.ctx != null and f.s.ctx == null and f.b.ctx == null);
+        // The down projection lives beside it, under the same container, named without a suffix.
+        try put(&w, "model.layers.1.mlp.experts.down_proj");
+        const dn = try expertTriple(&w, &buf, "model", 1, "mlp.experts.down_proj");
+        try std.testing.expect(dn.w.ctx != null and dn.s.ctx == null);
+    }
+    {
+        // A quantized fused pack names the same rows `.weight` beside their `.scales`.
+        var w = model_mod.Weights.init(std.testing.allocator);
+        defer w.deinit();
+        try put(&w, "model.layers.1.mlp.experts.gate_up_proj.weight");
+        try put(&w, "model.layers.1.mlp.experts.gate_up_proj.scales");
+        try put(&w, "model.layers.1.mlp.experts.down_proj.weight");
+        const f = fusedGateUp(&w, &buf, "model", 1).?;
+        try std.testing.expect(f.w.ctx != null and f.s.ctx != null and f.b.ctx == null);
+        const dn = try expertTriple(&w, &buf, "model", 1, "mlp.experts.down_proj");
+        try std.testing.expect(dn.w.ctx != null);
+        // A projection the pack holds under neither name is a load error, named.
+        try std.testing.expectError(error.MissingWeight, expertTriple(&w, &buf, "model", 1, "mlp.experts.up_proj"));
+    }
+    {
+        // mlx-lm's own naming is not fused: the caller keeps reading `mlp.switch_mlp.*`.
+        var w = model_mod.Weights.init(std.testing.allocator);
+        defer w.deinit();
+        try put(&w, "model.layers.1.mlp.switch_mlp.gate_proj.weight");
+        try std.testing.expect(fusedGateUp(&w, &buf, "model", 1) == null);
+    }
 }
 
 test "a quantized block_inject_weight loads as the dense checkpoint holding its dequantized values" {
